@@ -1,9 +1,10 @@
-import streamlit as st
 from dataclasses import dataclass
+import requests
+import streamlit as st
 
 st.set_page_config(page_title="Street Alpha | Deal Screen", page_icon="◼", layout="wide")
 
-st.markdown('''
+st.markdown("""
 <style>
 :root {
   --bg:#F6F1E8; --card:#FFFDFC; --text:#1F1F1F;
@@ -28,15 +29,130 @@ div[data-testid="stMetric"] {
   background:#EFE2E3; color:var(--accent); font-weight:800; margin-left:8px;
 }
 </style>
-''', unsafe_allow_html=True)
+""", unsafe_allow_html=True)
+
+API_URL = "https://apis.data.go.kr/B553077/api/open/sdsc2/storeListInRadius"
+PRESET_LOCATIONS = {
+    "성수역": (127.0561, 37.5446),
+    "강남역": (127.0276, 37.4979),
+    "홍대입구역": (126.9240, 37.5572),
+    "을지로3가역": (126.9921, 37.5663),
+    "여의도역": (126.9245, 37.5217),
+    "직접 좌표 입력": None,
+}
+
+
+def get_api_key():
+    try:
+        return st.secrets.get("DATA_GO_KR_API_KEY", "")
+    except Exception:
+        return ""
+
+
+def normalize_items(data):
+    root = data.get("response", data) if isinstance(data, dict) else {}
+    header = root.get("header", {}) if isinstance(root, dict) else {}
+    body = root.get("body", {}) if isinstance(root, dict) else {}
+
+    result_code = str(header.get("resultCode", header.get("resultcode", "00")))
+    result_msg = header.get("resultMsg", header.get("resultmsg", ""))
+    if result_code not in ("00", "0", "0000"):
+        raise RuntimeError(f"공공데이터 API 오류 {result_code}: {result_msg}")
+
+    items = body.get("items", []) if isinstance(body, dict) else []
+    if isinstance(items, dict):
+        items = items.get("item", [])
+    if items is None:
+        items = []
+    if isinstance(items, dict):
+        items = [items]
+
+    total_count = body.get("totalCount", len(items)) if isinstance(body, dict) else len(items)
+    try:
+        total_count = int(total_count)
+    except (TypeError, ValueError):
+        total_count = len(items)
+    return items, total_count
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_stores_in_radius(api_key, lon, lat, radius, max_items=500):
+    all_items = []
+    page = 1
+    rows = 100
+    total_count = None
+
+    while len(all_items) < max_items:
+        params = {
+            "ServiceKey": api_key,
+            "pageNo": page,
+            "numOfRows": rows,
+            "radius": int(radius),
+            "cx": float(lon),
+            "cy": float(lat),
+            "type": "json",
+        }
+        response = requests.get(API_URL, params=params, timeout=15)
+        response.raise_for_status()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            snippet = response.text[:300].replace("\n", " ")
+            raise RuntimeError(f"JSON 응답이 아닙니다: {snippet}") from exc
+
+        items, page_total = normalize_items(data)
+        if total_count is None:
+            total_count = page_total
+        all_items.extend(items)
+        if not items or len(all_items) >= page_total or len(items) < rows:
+            break
+        page += 1
+        if page > 10:
+            break
+
+    return all_items[:max_items], (total_count or len(all_items))
+
+
+def safe_text(v):
+    return "" if v is None else str(v).strip()
+
+
+def store_to_row(item):
+    return {
+        "상호명": safe_text(item.get("bizesNm")),
+        "지점명": safe_text(item.get("brchNm")),
+        "업종 대분류": safe_text(item.get("indsLclsNm")),
+        "업종 중분류": safe_text(item.get("indsMclsNm")),
+        "업종 소분류": safe_text(item.get("indsSclsNm")),
+        "도로명주소": safe_text(item.get("rdnmAdr")),
+        "지번주소": safe_text(item.get("lnoAdr")),
+        "경도": item.get("lon", ""),
+        "위도": item.get("lat", ""),
+        "상가업소번호": safe_text(item.get("bizesId")),
+    }
+
+
+def competition_level_from_count(count):
+    if count <= 2:
+        return 1
+    if count <= 5:
+        return 2
+    if count <= 10:
+        return 3
+    if count <= 20:
+        return 4
+    return 5
+
 
 def clamp(v, lo=0.0, hi=100.0):
     return max(lo, min(hi, float(v)))
+
 
 def linear_score(value, bad, good):
     if good == bad:
         return 50.0
     return clamp((value - bad) / (good - bad) * 100)
+
 
 def grade_from_score(score):
     if score >= 85: return "A"
@@ -45,6 +161,7 @@ def grade_from_score(score):
     if score >= 55: return "C+"
     if score >= 45: return "C"
     return "D"
+
 
 @dataclass
 class Inputs:
@@ -70,6 +187,7 @@ class Inputs:
     customer_concentration: int
     evidence_quality: int
 
+
 def calculate_scores(x):
     operating_profit = x.monthly_revenue - x.cogs - x.labor - x.rent - x.other_costs
     margin = (operating_profit / x.monthly_revenue * 100) if x.monthly_revenue > 0 else -100
@@ -83,25 +201,21 @@ def calculate_scores(x):
         + 0.25 * linear_score(payback_years, 6, 2)
         + 0.15 * linear_score(rent_ratio, 20, 7)
     )
-
     commercial = (
         0.35 * linear_score(x.years_operated, 1, 10)
         + 0.30 * linear_score(x.competition_level, 5, 1)
         + 0.35 * linear_score(x.demand_stability, 1, 5)
     )
-
     independence = (
         0.45 * linear_score(x.owner_hours, 70, 10)
         + 0.25 * (100 if x.manager_exists else 25)
         + 0.30 * linear_score(x.sop_level, 1, 5)
     )
-
     growth = (
         0.45 * linear_score(x.capacity_headroom, 1, 5)
         + 0.35 * linear_score(x.digital_gap, 1, 5)
         + 0.20 * linear_score(x.revenue_growth, -10, 15)
     )
-
     risk_control = (
         0.35 * linear_score(x.lease_months, 6, 60)
         + 0.25 * linear_score(x.customer_concentration, 5, 1)
@@ -123,7 +237,6 @@ def calculate_scores(x):
         "리스크 통제": 0.10,
     }
     overall = sum(scores[k] * weights[k] for k in scores)
-
     metrics = {
         "영업이익": operating_profit,
         "영업이익률": margin,
@@ -134,9 +247,9 @@ def calculate_scores(x):
     }
     return scores, metrics
 
+
 def generate_findings(x, m):
     strengths, risks, questions = [], [], []
-
     if m["영업이익률"] >= 15:
         strengths.append(f"영업이익률 {m['영업이익률']:.1f}%로 수익성이 비교적 양호합니다.")
     if x.years_operated >= 7:
@@ -177,22 +290,108 @@ def generate_findings(x, m):
         strengths.append("현재 입력값만으로 뚜렷한 강점 신호가 부족합니다. 원자료 확보 후 재평가가 필요합니다.")
     if not risks:
         risks.append("큰 경고 신호는 적지만 실제 인수 전 원자료 검증은 별도로 필요합니다.")
-
     return strengths, risks, questions
+
 
 def fmt_money(v):
     return f"{v:,.0f}만원"
 
+
+DEFAULTS = {
+    "store_name": "샘플 PC방",
+    "category": "PC방",
+    "address": "서울특별시 성동구",
+    "competition_level": 3,
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
 st.markdown('<div class="sa-kicker">STREET ALPHA / DEAL SCREEN</div>', unsafe_allow_html=True)
 st.title("작은 가게를, 인수 가능한 사업체처럼 분석합니다.")
-st.caption("MVP v0.1 · 현재 점수는 휴리스틱 기반이며 실제 투자 의사결정·기업가치평가를 대체하지 않습니다.")
+st.caption("MVP v0.2 · 공공 상가데이터 + 사용자 입력 기반 1차 스크리닝")
+
+st.subheader("0. 실제 상가 공공데이터 불러오기")
+st.caption("소상공인시장진흥공단 상가(상권)정보 API에서 실제 영업 중 상가의 상호명·업종·주소·좌표를 조회합니다. 매출·임대료·인건비는 공개되지 않으므로 별도 입력이 필요합니다.")
+
+api_key = get_api_key()
+if not api_key:
+    st.error("Streamlit Secrets에 DATA_GO_KR_API_KEY가 없습니다. Manage app → Settings → Secrets에서 키를 저장하세요.")
+else:
+    location_col, radius_col = st.columns([2, 1])
+    location_name = location_col.selectbox("기준 위치", list(PRESET_LOCATIONS.keys()))
+    radius = radius_col.select_slider("조회 반경", options=[200, 300, 500, 800, 1000, 1500, 2000], value=500, format_func=lambda x: f"{x}m")
+
+    if location_name == "직접 좌표 입력":
+        c1, c2 = st.columns(2)
+        lon = c1.number_input("경도", value=127.0276, format="%.6f")
+        lat = c2.number_input("위도", value=37.4979, format="%.6f")
+    else:
+        lon, lat = PRESET_LOCATIONS[location_name]
+        st.caption(f"기준 좌표 · 경도 {lon:.4f} / 위도 {lat:.4f}")
+
+    if st.button("공공데이터 불러오기", type="primary", use_container_width=True):
+        try:
+            with st.spinner("실제 상가 데이터를 불러오는 중입니다..."):
+                stores, total_count = fetch_stores_in_radius(api_key, lon, lat, radius)
+            st.session_state["public_stores"] = stores
+            st.session_state["public_total"] = total_count
+            st.session_state["public_radius"] = radius
+            st.success(f"연결 성공 · 반경 {radius}m 내 총 {total_count:,}개 업소 중 최대 {len(stores):,}개를 불러왔습니다.")
+        except Exception as exc:
+            st.error(f"공공데이터 조회 실패: {exc}")
+
+    stores = st.session_state.get("public_stores", [])
+    if stores:
+        rows = [store_to_row(x) for x in stores]
+        keyword = st.text_input("매장명·주소·업종으로 결과 필터", placeholder="예: PC방, 카페, 성수")
+        filtered = rows
+        if keyword.strip():
+            needle = keyword.strip().lower()
+            filtered = [r for r in rows if needle in " ".join(safe_text(v) for v in r.values()).lower()]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("불러온 업소", f"{len(rows):,}개")
+        m2.metric("필터 결과", f"{len(filtered):,}개")
+        unique_small = len({r["업종 소분류"] for r in filtered if r["업종 소분류"]})
+        m3.metric("업종 소분류", f"{unique_small:,}개")
+
+        if filtered:
+            st.dataframe(filtered, use_container_width=True, hide_index=True, height=320)
+            labels = []
+            for i, row in enumerate(filtered[:200]):
+                category = row["업종 소분류"] or row["업종 중분류"] or row["업종 대분류"]
+                address = row["도로명주소"] or row["지번주소"]
+                labels.append(f"{i+1}. {row['상호명']} · {category} · {address}")
+
+            selected_label = st.selectbox("진단할 매장 선택", labels)
+            selected_idx = labels.index(selected_label)
+            selected = filtered[selected_idx]
+            selected_small = selected["업종 소분류"]
+            same_category_count = sum(1 for r in rows if selected_small and r["업종 소분류"] == selected_small)
+
+            st.info(
+                f"선택 매장: **{selected['상호명']}** · {selected_small or selected['업종 중분류']}  |  "
+                f"현재 조회 반경 내 같은 소분류 업소 **{same_category_count}개**"
+            )
+
+            if st.button("선택 매장으로 아래 진단 시작", use_container_width=True):
+                st.session_state["store_name"] = selected["상호명"] or "선택 매장"
+                st.session_state["category"] = selected_small or selected["업종 중분류"] or selected["업종 대분류"] or "기타"
+                st.session_state["address"] = selected["도로명주소"] or selected["지번주소"]
+                st.session_state["competition_level"] = competition_level_from_count(same_category_count)
+                st.rerun()
+        else:
+            st.warning("필터 조건과 일치하는 매장이 없습니다.")
+
+st.divider()
 
 with st.form("deal_form"):
     st.subheader("1. 매장 기본 정보")
-    c1, c2, c3 = st.columns([1.2, 1, 1.8])
-    store_name = c1.text_input("매장명", value="샘플 PC방")
-    category = c2.selectbox("업종", ["PC방", "코인노래방", "코인세탁소", "무인카페", "카페", "음식점", "기타"])
-    address = c3.text_input("주소", value="서울특별시 성동구")
+    c1, c2, c3 = st.columns([1.2, 1.2, 2.0])
+    store_name = c1.text_input("매장명", key="store_name")
+    category = c2.text_input("업종", key="category")
+    address = c3.text_input("주소", key="address")
     years_operated = st.slider("운영기간(년)", 0.0, 30.0, 8.0, 0.5)
 
     st.subheader("2. 재무")
@@ -224,7 +423,7 @@ with st.form("deal_form"):
     st.subheader("4. 시장·성장·리스크")
     a, b, c, d = st.columns(4)
     competition_level = a.select_slider(
-        "경쟁 강도", options=[1,2,3,4,5], value=3,
+        "경쟁 강도", options=[1,2,3,4,5], key="competition_level",
         format_func=lambda v: ["매우 낮음","낮음","보통","높음","매우 높음"][v-1]
     )
     demand_stability = b.select_slider(
@@ -275,10 +474,7 @@ if submitted:
         st.markdown(card, unsafe_allow_html=True)
         st.metric("월 추정 영업이익", fmt_money(metrics["영업이익"]))
         st.metric("영업이익률", f"{metrics['영업이익률']:.1f}%")
-        st.metric(
-            "단순 투자금 회수기간",
-            f"{metrics['단순 회수기간']:.1f}년" if metrics["단순 회수기간"] < 90 else "산정 불가"
-        )
+        st.metric("단순 투자금 회수기간", f"{metrics['단순 회수기간']:.1f}년" if metrics["단순 회수기간"] < 90 else "산정 불가")
 
     with right:
         st.subheader("평가 항목")
@@ -311,27 +507,16 @@ if submitted:
         f"월매출 **{fmt_money(x.monthly_revenue)}**, 추정 영업이익 **{fmt_money(metrics['영업이익'])}**, "
         f"영업이익률 **{metrics['영업이익률']:.1f}%**이며, 희망 인수가격 **{fmt_money(x.asking_price)}** 기준 "
         f"단순 회수기간은 **{metrics['단순 회수기간']:.1f}년**입니다.\n\n"
-        "현재 결과는 입력값과 내부 휴리스틱에 기반한 1차 스크리닝입니다. "
+        "현재 결과는 공공 상가정보와 사용자 입력값, 내부 휴리스틱에 기반한 1차 스크리닝입니다. "
         "실제 인수 검토에서는 POS·세무자료·임대차계약·인건비·설비 교체비·대표자 대체 가능성을 원자료로 확인해야 합니다."
     )
     st.info(summary)
 
     report_lines = [
-        "STREET ALPHA DEAL SCREEN",
-        "",
-        f"매장명: {x.store_name}",
-        f"업종: {x.category}",
-        f"주소: {x.address}",
-        "",
-        f"종합점수: {score:.0f}/100 ({grade})",
-        "",
-        "[핵심 지표]",
-        f"월매출: {fmt_money(x.monthly_revenue)}",
-        f"월 추정 영업이익: {fmt_money(metrics['영업이익'])}",
-        f"영업이익률: {metrics['영업이익률']:.1f}%",
-        f"단순 회수기간: {metrics['단순 회수기간']:.1f}년",
-        "",
-        "[항목별 점수]",
+        "STREET ALPHA DEAL SCREEN", "", f"매장명: {x.store_name}", f"업종: {x.category}", f"주소: {x.address}", "",
+        f"종합점수: {score:.0f}/100 ({grade})", "", "[핵심 지표]", f"월매출: {fmt_money(x.monthly_revenue)}",
+        f"월 추정 영업이익: {fmt_money(metrics['영업이익'])}", f"영업이익률: {metrics['영업이익률']:.1f}%",
+        f"단순 회수기간: {metrics['단순 회수기간']:.1f}년", "", "[항목별 점수]",
     ]
     report_lines += [f"- {k}: {v:.0f}/100" for k, v in scores.items()]
     report_lines += ["", "[강점]"] + [f"- {s}" for s in strengths]
@@ -345,13 +530,4 @@ if submitted:
         file_name="street_alpha_deal_screen.txt",
         mime="text/plain",
         use_container_width=True,
-    )
-else:
-    st.markdown(
-        '<div class="sa-card"><b>이 버전에서 되는 것</b><br><br>'
-        '매출·비용·대표자 의존도·임대차·시장 입력값을 받아 5개 항목을 점수화하고, '
-        '강점·리스크·실사 질문까지 자동 생성합니다.<br><br>'
-        '<span class="sa-muted">다음 버전: 공공데이터 상권 자동조회 → AI 설명 → PDF Deal Screen → DB 저장</span>'
-        '</div>',
-        unsafe_allow_html=True
     )
