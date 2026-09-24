@@ -29,6 +29,43 @@ div[data-testid="stMetric"] {
   display:inline-block; padding:5px 10px; border-radius:999px;
   background:#EFE2E3; color:var(--accent); font-weight:800; margin-left:8px;
 }
+
+/* S1 가독성 보완: 기존 배치·색상 토큰을 유지하고 텍스트 대비만 보정합니다. */
+.stApp [data-testid="stMetricLabel"],
+.stApp [data-testid="stMetricLabel"] *,
+.stApp [data-testid="stMetricValue"],
+.stApp [data-testid="stMetricValue"] *,
+.stApp [data-testid="stWidgetLabel"],
+.stApp [data-testid="stWidgetLabel"] * {
+  color: var(--text) !important;
+}
+.stApp [data-testid="stAlert"] [data-testid="stMarkdownContainer"],
+.stApp [data-testid="stAlert"] [data-testid="stMarkdownContainer"] p,
+.stApp [data-testid="stAlert"] [data-testid="stMarkdownContainer"] span,
+.stApp [data-testid="stAlert"] [data-testid="stMarkdownContainer"] strong,
+.stApp [data-testid="stAlert"] [data-testid="stMarkdownContainer"] li {
+  color: var(--text) !important;
+}
+/* 보조 버튼은 기존 카드색/본문색을 짝지어 밝은/어두운 테마 모두에서 읽히게 합니다. */
+.stApp [data-testid="stButton"] button[kind="secondary"],
+.stApp [data-testid="stButton"] button[data-testid="stBaseButton-secondary"] {
+  background-color: var(--card) !important;
+  color: var(--text) !important;
+  border-color: var(--line) !important;
+}
+.stApp [data-testid="stButton"] button[kind="secondary"] *,
+.stApp [data-testid="stButton"] button[data-testid="stBaseButton-secondary"] * {
+  color: inherit !important;
+}
+.stApp [data-testid="stButton"] button[kind="secondary"]:hover:not(:disabled),
+.stApp [data-testid="stButton"] button[data-testid="stBaseButton-secondary"]:hover:not(:disabled) {
+  border-color: var(--accent) !important;
+}
+.stApp [data-testid="stButton"] button[kind="secondary"]:focus-visible,
+.stApp [data-testid="stButton"] button[data-testid="stBaseButton-secondary"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -423,7 +460,7 @@ for k, v in DEFAULTS.items():
 
 st.markdown('<div class="sa-kicker">STREET ALPHA / DEAL SCREEN</div>', unsafe_allow_html=True)
 st.title("작은 가게를, 인수 가능한 사업체처럼 분석합니다.")
-st.caption("MVP v0.3 · S1 매장 검색·공개 기본정보 카드 + 사용자 입력 기반 1차 스크리닝")
+st.caption("MVP v0.3.1 · S1 매장 검색·공개 기본정보 카드 + 사용자 입력 기반 1차 스크리닝")
 
 st.subheader("0. 실제 상가 공공데이터 불러오기")
 st.caption("소상공인시장진흥공단 상가(상권)정보 API에서 실제 영업 중 상가의 상호명·업종·주소·좌표를 조회합니다. 매출·임대료·인건비는 공개되지 않으므로 별도 입력이 필요합니다.")
