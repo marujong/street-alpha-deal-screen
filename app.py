@@ -1,5 +1,9 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial as bind_callback
+from collections.abc import Mapping
+import hashlib
+import json
 import requests
 import streamlit as st
 
@@ -283,6 +287,90 @@ def missing_public_fields(row):
     return missing
 
 
+
+def build_store_choices(rows):
+    """Keep source identity and occurrence separate; never merge by name."""
+    options, labels, row_by_key = [], {}, {}
+    occurrences = {}
+    for i, row in enumerate(rows):
+        raw_id = safe_text(row.get("상가업소번호"))
+        if raw_id:
+            base = "D01:" + raw_id
+        else:
+            payload = json.dumps(row, ensure_ascii=False, sort_keys=True)
+            base = "unverified:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        occurrence = occurrences.get(base, 0)
+        occurrences[base] = occurrence + 1
+        key = f"{base}:{occurrence}"
+        category = row.get("업종 소분류") or row.get("업종 중분류") or row.get("업종 대분류") or "업종 미확인"
+        address = row.get("도로명주소") or row.get("지번주소") or "주소 미확인"
+        name = row.get("상호명") or "상호 미확인"
+        branch = f" {row['지점명']}" if row.get("지점명") else ""
+        options.append(key)
+        labels[key] = f"{i + 1}. {name}{branch} · {category} · {address}"
+        row_by_key[key] = row
+    return options, labels, row_by_key
+
+
+def store_view_signature(rows, keyword, fetch_meta):
+    """Bind row positions to the exact displayed view, not a previous filter."""
+    payload = json.dumps(
+        [rows, keyword.strip().lower(), fetch_meta.get("retrieved_at")],
+        ensure_ascii=False, sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def prepare_store_selection(options, view_signature):
+    """Set widget state before rendering widgets. Empty results clear the card only."""
+    state = st.session_state
+    state["s1_store_view"] = view_signature
+    state["s1_store_options"] = list(options)
+    state.setdefault("s1_table_epoch", 0)
+    if not options:
+        state.pop("s1_selected_store_key", None)
+        state.pop("s1_store_picker", None)
+        return
+    chosen = state.get("s1_selected_store_key")
+    if chosen not in options:
+        chosen = options[0]
+    state["s1_selected_store_key"] = chosen
+    if state.get("s1_store_picker") != chosen:
+        state["s1_store_picker"] = chosen
+
+
+def on_store_table_select(table_key, options, view_signature):
+    """Streamlit runs this callback before the app, so the picker stays synchronized."""
+    state = st.session_state
+    if state.get("s1_store_view") != view_signature:
+        return
+    event = state.get(table_key, {})
+    selection = event.get("selection", {}) if isinstance(event, Mapping) else {}
+    positions = selection.get("rows", []) if isinstance(selection, Mapping) else []
+    if not isinstance(positions, list) or len(positions) != 1:
+        return
+    position = positions[0]
+    if type(position) is not int or not 0 <= position < len(options):
+        return
+    chosen = options[position]
+    if chosen not in state.get("s1_store_options", []):
+        return
+    state["s1_selected_store_key"] = chosen
+    state["s1_store_picker"] = chosen
+
+
+def on_store_picker_change():
+    """A dropdown choice supersedes any previous table choice without refetching."""
+    state = st.session_state
+    chosen = state.get("s1_store_picker")
+    if chosen not in state.get("s1_store_options", []):
+        return
+    state["s1_selected_store_key"] = chosen
+    # A new table widget clears the old row highlight. We never mutate read-only
+    # dataframe event state, keeping this compatible with older selection APIs.
+    state["s1_table_epoch"] = state.get("s1_table_epoch", 0) + 1
+
+
 def competition_level_from_count(count):
     if count <= 2:
         return 1
@@ -460,7 +548,7 @@ for k, v in DEFAULTS.items():
 
 st.markdown('<div class="sa-kicker">STREET ALPHA / DEAL SCREEN</div>', unsafe_allow_html=True)
 st.title("작은 가게를, 인수 가능한 사업체처럼 분석합니다.")
-st.caption("MVP v0.3.1 · S1 매장 검색·공개 기본정보 카드 + 사용자 입력 기반 1차 스크리닝")
+st.caption("MVP v0.3.2 · S1 매장 검색·공개 기본정보 카드 + 사용자 입력 기반 1차 스크리닝")
 
 st.subheader("0. 실제 상가 공공데이터 불러오기")
 st.caption("소상공인시장진흥공단 상가(상권)정보 API에서 실제 영업 중 상가의 상호명·업종·주소·좌표를 조회합니다. 매출·임대료·인건비는 공개되지 않으므로 별도 입력이 필요합니다.")
@@ -540,27 +628,30 @@ else:
         unique_small = len({r["업종 소분류"] for r in filtered if r["업종 소분류"]})
         m3.metric("업종 소분류", f"{unique_small:,}개")
 
+        options, labels, row_by_key = build_store_choices(filtered)
+        view_signature = store_view_signature(filtered, keyword, fetch_meta)
+        prepare_store_selection(options, view_signature)
+
         if filtered:
             display_columns = [
                 "상호명", "지점명", "업종 대분류", "업종 중분류", "업종 소분류",
                 "도로명주소", "지번주소", "상가업소번호", "경도", "위도", "좌표상태"
             ]
-            st.dataframe([{k: r.get(k) for k in display_columns} for r in filtered], use_container_width=True, hide_index=True, height=320)
-            selectable = filtered[:200]
-            if len(filtered) > len(selectable):
-                st.caption(f"선택 목록은 현재 필터 결과 {len(filtered):,}개 중 앞 {len(selectable):,}개만 표시합니다.")
-
-            labels = []
-            for i, row in enumerate(selectable):
-                category = row["업종 소분류"] or row["업종 중분류"] or row["업종 대분류"] or "업종 미확인"
-                address = row["도로명주소"] or row["지번주소"] or "주소 미확인"
-                name = row["상호명"] or "상호 미확인"
-                branch = f" {row['지점명']}" if row["지점명"] else ""
-                labels.append(f"{i+1}. {name}{branch} · {category} · {address}")
-
-            selected_label = st.selectbox("진단할 매장 선택", labels)
-            selected_idx = labels.index(selected_label)
-            selected = selectable[selected_idx]
+            st.caption("표 왼쪽 선택칸을 클릭하거나 아래 목록에서 매장을 고르면 기본카드가 바뀝니다. 검색어 입력은 선택 사항입니다.")
+            table_key = f"s1_store_table_{view_signature}_{st.session_state['s1_table_epoch']}"
+            st.dataframe(
+                [{k: r.get(k) for k in display_columns} for r in filtered],
+                use_container_width=True, hide_index=True, height=320,
+                key=table_key, selection_mode="single-row",
+                on_select=bind_callback(on_store_table_select, table_key, tuple(options), view_signature),
+            )
+            st.caption(f"아래 목록에서 현재 필터 결과 {len(options):,}개 모두 선택할 수 있습니다. 전체 매장 검색이 아니라 불러온 범위 내 선택입니다.")
+            selected_key = st.selectbox(
+                "진단할 매장 선택", options, format_func=labels.__getitem__,
+                key="s1_store_picker", on_change=on_store_picker_change,
+            )
+            selected = row_by_key[selected_key]
+            st.caption("선택 결과는 이 목록과 기본카드에서 확인하세요. 아래 진단 입력칸으로 옮기려면 카드 아래의 반영 버튼을 누르세요. 매출·비용은 자동으로 채우지 않습니다.")
             selected_small = selected["업종 소분류"]
             same_category_count = sum(1 for r in rows if selected_small and r["업종 소분류"] == selected_small)
             missing_fields = missing_public_fields(selected)
@@ -608,7 +699,7 @@ else:
             if partial:
                 st.caption("위 같은 소분류 개수는 전체 반경 업소 수가 아니라 현재 불러온 부분 결과 기준입니다. 점수의 경쟁 강도로 자동 반영하지 않습니다.")
 
-            if st.button("선택 매장으로 아래 진단 시작", use_container_width=True):
+            if st.button("선택 매장의 상호·업종·주소를 아래 입력칸에 반영", use_container_width=True):
                 st.session_state["store_name"] = selected["상호명"] or "선택 매장"
                 st.session_state["category"] = category if category != "미확인" else "기타"
                 st.session_state["address"] = address if address != "미확인" else ""
@@ -619,6 +710,9 @@ else:
                 st.rerun()
         else:
             st.warning("필터 조건과 일치하는 매장이 없습니다. 이 메시지는 API 오류와 구분되는 정상 '검색 결과 없음' 상태입니다.")
+
+if not st.session_state.get("public_stores"):
+    prepare_store_selection([], "no_public_rows")
 
 st.divider()
 
