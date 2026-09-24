@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import requests
 import streamlit as st
 
@@ -32,6 +33,10 @@ div[data-testid="stMetric"] {
 """, unsafe_allow_html=True)
 
 API_URL = "https://apis.data.go.kr/B553077/api/open/sdsc2/storeListInRadius"
+SOURCE_ID = "D01"
+SOURCE_LABEL = "소상공인시장진흥공단 상가(상권)정보 API"
+REFERENCE_PERIOD_LABEL = "미확인"
+SUCCESS_CODES = {"00", "0", "0000"}
 PRESET_LOCATIONS = {
     "성수역": (127.0561, 37.5446),
     "강남역": (127.0276, 37.4979),
@@ -42,6 +47,17 @@ PRESET_LOCATIONS = {
 }
 
 
+class StoreAPIError(RuntimeError):
+    def __init__(self, kind, message, code=None):
+        super().__init__(message)
+        self.kind = kind
+        self.code = code
+
+
+def safe_text(v):
+    return "" if v is None else str(v).strip()
+
+
 def get_api_key():
     try:
         return st.secrets.get("DATA_GO_KR_API_KEY", "")
@@ -50,29 +66,67 @@ def get_api_key():
 
 
 def normalize_items(data):
-    root = data.get("response", data) if isinstance(data, dict) else {}
-    header = root.get("header", {}) if isinstance(root, dict) else {}
-    body = root.get("body", {}) if isinstance(root, dict) else {}
+    if not isinstance(data, dict):
+        raise StoreAPIError("schema_error", "공급사 응답 형식이 예상과 다릅니다.")
 
-    result_code = str(header.get("resultCode", header.get("resultcode", "00")))
-    result_msg = header.get("resultMsg", header.get("resultmsg", ""))
-    if result_code not in ("00", "0", "0000"):
-        raise RuntimeError(f"공공데이터 API 오류 {result_code}: {result_msg}")
+    root = data.get("response")
+    if root is None and "header" in data and "body" in data:
+        root = data
+    if not isinstance(root, dict):
+        raise StoreAPIError("schema_error", "공급사 응답에 response 구조가 없습니다.")
 
-    items = body.get("items", []) if isinstance(body, dict) else []
+    header = root.get("header")
+    body = root.get("body")
+    if not isinstance(header, dict) or not isinstance(body, dict):
+        raise StoreAPIError("schema_error", "공급사 응답의 header/body 구조를 확인할 수 없습니다.")
+
+    raw_code = header.get("resultCode", header.get("resultcode"))
+    if raw_code is None:
+        raise StoreAPIError("schema_error", "공급사 응답에 결과 코드가 없습니다.")
+    result_code = str(raw_code)
+    if result_code not in SUCCESS_CODES:
+        raise StoreAPIError("provider_error", f"공공데이터 공급사 오류 ({result_code})", code=result_code)
+
+    items = body.get("items", [])
     if isinstance(items, dict):
         items = items.get("item", [])
     if items is None:
         items = []
     if isinstance(items, dict):
         items = [items]
+    if not isinstance(items, list):
+        raise StoreAPIError("schema_error", "공급사 응답의 매장 목록 형식이 예상과 다릅니다.")
 
-    total_count = body.get("totalCount", len(items)) if isinstance(body, dict) else len(items)
+    total_count = body.get("totalCount", len(items))
     try:
         total_count = int(total_count)
     except (TypeError, ValueError):
-        total_count = len(items)
+        raise StoreAPIError("schema_error", "공급사 응답의 전체 건수를 해석할 수 없습니다.")
+    if total_count < 0:
+        raise StoreAPIError("schema_error", "공급사 응답의 전체 건수가 올바르지 않습니다.")
     return items, total_count
+
+
+def classify_http_status(status_code):
+    if status_code in (401, 403):
+        return "permission_error"
+    if status_code == 429:
+        return "rate_limit_error"
+    return "provider_error"
+
+
+def public_error_message(exc):
+    messages = {
+        "permission_error": "공공데이터 조회 권한 오류입니다. 인증키 값은 화면에 표시하지 않았습니다.",
+        "rate_limit_error": "공공데이터 호출 한도에 도달했거나 일시적으로 제한되었습니다.",
+        "network_error": "공공데이터 공급사 연결에 실패했습니다. 잠시 뒤 다시 시도하세요.",
+        "schema_error": "공공데이터 응답 구조를 해석하지 못했습니다. 오류를 정상 0건으로 처리하지 않았습니다.",
+        "provider_error": "공공데이터 공급사 오류로 조회하지 못했습니다.",
+    }
+    text = messages.get(getattr(exc, "kind", None), "공공데이터 조회 중 알 수 없는 오류가 발생했습니다.")
+    if getattr(exc, "code", None):
+        text += f" 오류 코드: {exc.code}"
+    return text
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -92,13 +146,21 @@ def fetch_stores_in_radius(api_key, lon, lat, radius, max_items=500):
             "cy": float(lat),
             "type": "json",
         }
-        response = requests.get(API_URL, params=params, timeout=15)
-        response.raise_for_status()
+        try:
+            response = requests.get(API_URL, params=params, timeout=15)
+        except requests.Timeout as exc:
+            raise StoreAPIError("network_error", "공급사 응답 시간이 초과되었습니다.") from exc
+        except requests.RequestException as exc:
+            raise StoreAPIError("network_error", "공급사 연결 요청에 실패했습니다.") from exc
+
+        if not response.ok:
+            kind = classify_http_status(response.status_code)
+            raise StoreAPIError(kind, "공급사 HTTP 오류", code=str(response.status_code))
+
         try:
             data = response.json()
         except ValueError as exc:
-            snippet = response.text[:300].replace("\n", " ")
-            raise RuntimeError(f"JSON 응답이 아닙니다: {snippet}") from exc
+            raise StoreAPIError("schema_error", "공급사가 JSON이 아닌 응답을 반환했습니다.") from exc
 
         items, page_total = normalize_items(data)
         if total_count is None:
@@ -110,14 +172,35 @@ def fetch_stores_in_radius(api_key, lon, lat, radius, max_items=500):
         if page > 10:
             break
 
-    return all_items[:max_items], (total_count or len(all_items))
+    retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    loaded_items = all_items[:max_items]
+    total_count = total_count if total_count is not None else len(loaded_items)
+    return loaded_items, total_count, {
+        "retrieved_at": retrieved_at,
+        "pages_requested": page,
+        "partial": len(loaded_items) < total_count,
+    }
 
 
-def safe_text(v):
-    return "" if v is None else str(v).strip()
+def normalize_coordinate(value, lower, upper):
+    if safe_text(value) == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not lower <= number <= upper:
+        return None
+    return number
 
 
 def store_to_row(item):
+    lon_raw = item.get("lon", "")
+    lat_raw = item.get("lat", "")
+    lon = normalize_coordinate(lon_raw, -180, 180)
+    lat = normalize_coordinate(lat_raw, -90, 90)
+    coord_missing = safe_text(lon_raw) == "" or safe_text(lat_raw) == ""
+    coord_status = "미확인" if coord_missing else ("정상" if lon is not None and lat is not None else "오류")
     return {
         "상호명": safe_text(item.get("bizesNm")),
         "지점명": safe_text(item.get("brchNm")),
@@ -126,10 +209,41 @@ def store_to_row(item):
         "업종 소분류": safe_text(item.get("indsSclsNm")),
         "도로명주소": safe_text(item.get("rdnmAdr")),
         "지번주소": safe_text(item.get("lnoAdr")),
-        "경도": item.get("lon", ""),
-        "위도": item.get("lat", ""),
+        "경도": lon,
+        "위도": lat,
+        "좌표상태": coord_status,
         "상가업소번호": safe_text(item.get("bizesId")),
     }
+
+
+def dedupe_rows_by_store_id(rows):
+    seen = set()
+    unique = []
+    duplicate_count = 0
+    for row in rows:
+        store_id = row.get("상가업소번호", "")
+        if store_id and store_id in seen:
+            duplicate_count += 1
+            continue
+        if store_id:
+            seen.add(store_id)
+        unique.append(row)
+    return unique, duplicate_count
+
+
+def missing_public_fields(row):
+    missing = []
+    if not row.get("상호명"):
+        missing.append("상호명")
+    if not (row.get("도로명주소") or row.get("지번주소")):
+        missing.append("주소")
+    if not (row.get("업종 소분류") or row.get("업종 중분류") or row.get("업종 대분류")):
+        missing.append("업종")
+    if not row.get("상가업소번호"):
+        missing.append("원본 ID")
+    if row.get("좌표상태") != "정상":
+        missing.append("좌표")
+    return missing
 
 
 def competition_level_from_count(count):
@@ -309,7 +423,7 @@ for k, v in DEFAULTS.items():
 
 st.markdown('<div class="sa-kicker">STREET ALPHA / DEAL SCREEN</div>', unsafe_allow_html=True)
 st.title("작은 가게를, 인수 가능한 사업체처럼 분석합니다.")
-st.caption("MVP v0.2 · 공공 상가데이터 + 사용자 입력 기반 1차 스크리닝")
+st.caption("MVP v0.3 · S1 매장 검색·공개 기본정보 카드 + 사용자 입력 기반 1차 스크리닝")
 
 st.subheader("0. 실제 상가 공공데이터 불러오기")
 st.caption("소상공인시장진흥공단 상가(상권)정보 API에서 실제 영업 중 상가의 상호명·업종·주소·좌표를 조회합니다. 매출·임대료·인건비는 공개되지 않으므로 별도 입력이 필요합니다.")
@@ -331,19 +445,52 @@ else:
         st.caption(f"기준 좌표 · 경도 {lon:.4f} / 위도 {lat:.4f}")
 
     if st.button("공공데이터 불러오기", type="primary", use_container_width=True):
+        st.session_state.pop("public_error", None)
         try:
             with st.spinner("실제 상가 데이터를 불러오는 중입니다..."):
-                stores, total_count = fetch_stores_in_radius(api_key, lon, lat, radius)
+                stores, total_count, fetch_meta = fetch_stores_in_radius(api_key, lon, lat, radius)
             st.session_state["public_stores"] = stores
             st.session_state["public_total"] = total_count
             st.session_state["public_radius"] = radius
-            st.success(f"연결 성공 · 반경 {radius}m 내 총 {total_count:,}개 업소 중 최대 {len(stores):,}개를 불러왔습니다.")
-        except Exception as exc:
-            st.error(f"공공데이터 조회 실패: {exc}")
+            st.session_state["public_location_name"] = location_name
+            st.session_state["public_fetch_meta"] = fetch_meta
+            if stores:
+                st.success(f"연결 성공 · 반경 {radius}m 내 공급사 전체 건수 {total_count:,}개 중 {len(stores):,}개를 불러왔습니다.")
+            else:
+                st.info("조회는 정상 처리됐지만 이 조건에 해당하는 매장이 없습니다.")
+        except StoreAPIError as exc:
+            st.session_state["public_stores"] = []
+            st.session_state["public_total"] = 0
+            st.session_state["public_fetch_meta"] = {}
+            st.session_state["public_error"] = exc.kind
+            st.error(public_error_message(exc))
+        except Exception:
+            st.session_state["public_stores"] = []
+            st.session_state["public_total"] = 0
+            st.session_state["public_fetch_meta"] = {}
+            st.session_state["public_error"] = "unknown_error"
+            st.error("공공데이터 조회 중 알 수 없는 오류가 발생했습니다. 인증키나 전체 요청 URL은 화면에 표시하지 않았습니다.")
 
     stores = st.session_state.get("public_stores", [])
     if stores:
-        rows = [store_to_row(x) for x in stores]
+        raw_rows = [store_to_row(x) for x in stores]
+        rows, duplicate_count = dedupe_rows_by_store_id(raw_rows)
+        total_count = st.session_state.get("public_total", len(raw_rows))
+        fetch_meta = st.session_state.get("public_fetch_meta", {})
+        partial = bool(fetch_meta.get("partial", len(raw_rows) < total_count))
+        invalid_coords = sum(1 for r in rows if r["좌표상태"] == "오류")
+        missing_coords = sum(1 for r in rows if r["좌표상태"] == "미확인")
+
+        if partial:
+            st.warning(
+                f"부분 결과입니다. 공급사 전체 건수는 {total_count:,}개로 표시됐지만 현재 화면에는 최대 {len(raw_rows):,}개만 불러왔습니다. "
+                "아래 필터와 동종업종 수는 이 불러온 범위 안에서만 계산됩니다."
+            )
+        if duplicate_count:
+            st.warning(f"같은 상가업소번호가 중복된 {duplicate_count:,}건을 화면 목록에서 한 번만 표시했습니다.")
+        if invalid_coords or missing_coords:
+            st.caption(f"좌표 품질 · 오류 {invalid_coords:,}건 / 미확인 {missing_coords:,}건")
+
         keyword = st.text_input("매장명·주소·업종으로 결과 필터", placeholder="예: PC방, 카페, 성수")
         filtered = rows
         if keyword.strip():
@@ -351,38 +498,90 @@ else:
             filtered = [r for r in rows if needle in " ".join(safe_text(v) for v in r.values()).lower()]
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("불러온 업소", f"{len(rows):,}개")
+        m1.metric("불러온 고유 업소", f"{len(rows):,}개")
         m2.metric("필터 결과", f"{len(filtered):,}개")
         unique_small = len({r["업종 소분류"] for r in filtered if r["업종 소분류"]})
         m3.metric("업종 소분류", f"{unique_small:,}개")
 
         if filtered:
-            st.dataframe(filtered, use_container_width=True, hide_index=True, height=320)
+            display_columns = [
+                "상호명", "지점명", "업종 대분류", "업종 중분류", "업종 소분류",
+                "도로명주소", "지번주소", "상가업소번호", "경도", "위도", "좌표상태"
+            ]
+            st.dataframe([{k: r.get(k) for k in display_columns} for r in filtered], use_container_width=True, hide_index=True, height=320)
+            selectable = filtered[:200]
+            if len(filtered) > len(selectable):
+                st.caption(f"선택 목록은 현재 필터 결과 {len(filtered):,}개 중 앞 {len(selectable):,}개만 표시합니다.")
+
             labels = []
-            for i, row in enumerate(filtered[:200]):
-                category = row["업종 소분류"] or row["업종 중분류"] or row["업종 대분류"]
-                address = row["도로명주소"] or row["지번주소"]
-                labels.append(f"{i+1}. {row['상호명']} · {category} · {address}")
+            for i, row in enumerate(selectable):
+                category = row["업종 소분류"] or row["업종 중분류"] or row["업종 대분류"] or "업종 미확인"
+                address = row["도로명주소"] or row["지번주소"] or "주소 미확인"
+                name = row["상호명"] or "상호 미확인"
+                branch = f" {row['지점명']}" if row["지점명"] else ""
+                labels.append(f"{i+1}. {name}{branch} · {category} · {address}")
 
             selected_label = st.selectbox("진단할 매장 선택", labels)
             selected_idx = labels.index(selected_label)
-            selected = filtered[selected_idx]
+            selected = selectable[selected_idx]
             selected_small = selected["업종 소분류"]
             same_category_count = sum(1 for r in rows if selected_small and r["업종 소분류"] == selected_small)
+            missing_fields = missing_public_fields(selected)
+            address = selected["도로명주소"] or selected["지번주소"] or "미확인"
+            category = selected_small or selected["업종 중분류"] or selected["업종 대분류"] or "미확인"
+            coverage_text = (
+                f"{st.session_state.get('public_location_name', '선택 위치')} 반경 {st.session_state.get('public_radius', 0)}m · "
+                f"{len(raw_rows):,}/{total_count:,}건 불러옴"
+            )
+            if partial:
+                coverage_text += " · 부분 결과"
+            else:
+                coverage_text += " · 현재 응답 범위 전체"
+
+            st.markdown("#### 공개 기본정보 카드")
+            with st.container(border=True):
+                st.markdown(f"### {selected['상호명'] or '상호 미확인'}{(' · ' + selected['지점명']) if selected['지점명'] else ''}")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.write("**업종**", category)
+                    st.write("**주소**", address)
+                    st.write("**상가업소번호**", selected["상가업소번호"] or "미확인")
+                    if selected["좌표상태"] == "정상":
+                        st.write("**좌표**", f"{selected['위도']:.6f}, {selected['경도']:.6f}")
+                    else:
+                        st.write("**좌표**", f"{selected['좌표상태']}")
+                with c2:
+                    st.write("**출처**", f"{SOURCE_ID} · {SOURCE_LABEL}")
+                    st.write("**자료 기준일**", REFERENCE_PERIOD_LABEL)
+                    st.write("**수집 시각(UTC)**", fetch_meta.get("retrieved_at", "미확인"))
+                    st.write("**수집 범위**", coverage_text)
+                    st.write("**데이터 성격**", "공개 관측값")
+
+                if missing_fields:
+                    st.warning("확인하지 못한 기본정보: " + ", ".join(missing_fields))
+                else:
+                    st.caption("기본카드 필수 공개 필드는 현재 선택 항목에서 모두 확인됐습니다.")
+                st.info("매출·임대료·인건비·희망 인수가격·대표자 의존도는 이 공개자료에서 확인되지 않습니다. 아래 진단 입력값과 구분해서 봐야 합니다.")
+                st.caption("자료 기준일은 현재 사용 중인 D01 응답 필드에서 확인하지 못해 임의 날짜 대신 '미확인'으로 표시합니다.")
 
             st.info(
-                f"선택 매장: **{selected['상호명']}** · {selected_small or selected['업종 중분류']}  |  "
-                f"현재 조회 반경 내 같은 소분류 업소 **{same_category_count}개**"
+                f"선택 매장: **{selected['상호명'] or '상호 미확인'}** · {category}  |  "
+                f"현재 불러온 고유 업소 {len(rows):,}개 안에서 같은 소분류 **{same_category_count}개**"
             )
+            if partial:
+                st.caption("위 같은 소분류 개수는 전체 반경 업소 수가 아니라 현재 불러온 부분 결과 기준입니다. 점수의 경쟁 강도로 자동 반영하지 않습니다.")
 
             if st.button("선택 매장으로 아래 진단 시작", use_container_width=True):
                 st.session_state["store_name"] = selected["상호명"] or "선택 매장"
-                st.session_state["category"] = selected_small or selected["업종 중분류"] or selected["업종 대분류"] or "기타"
-                st.session_state["address"] = selected["도로명주소"] or selected["지번주소"]
-                st.session_state["competition_level"] = competition_level_from_count(same_category_count)
+                st.session_state["category"] = category if category != "미확인" else "기타"
+                st.session_state["address"] = address if address != "미확인" else ""
+                st.session_state["selected_public_store"] = True
+                st.session_state["selected_public_store_id"] = selected["상가업소번호"]
+                if not partial:
+                    st.session_state["competition_level"] = competition_level_from_count(same_category_count)
                 st.rerun()
         else:
-            st.warning("필터 조건과 일치하는 매장이 없습니다.")
+            st.warning("필터 조건과 일치하는 매장이 없습니다. 이 메시지는 API 오류와 구분되는 정상 '검색 결과 없음' 상태입니다.")
 
 st.divider()
 
@@ -395,6 +594,8 @@ with st.form("deal_form"):
     years_operated = st.slider("운영기간(년)", 0.0, 30.0, 8.0, 0.5)
 
     st.subheader("2. 재무")
+    if st.session_state.get("selected_public_store"):
+        st.warning("아래 재무·운영 기본값은 기존 MVP의 예시값이며 선택한 실제 매장의 공개자료가 아닙니다. 실제 자료로 바꾸기 전 점수를 해당 매장의 진단 결과로 해석하지 마세요.")
     a, b, c, d, e = st.columns(5)
     monthly_revenue = a.number_input("월매출(만원)", min_value=0.0, value=4200.0, step=100.0)
     cogs = b.number_input("원가/재료비(만원)", min_value=0.0, value=900.0, step=50.0)
